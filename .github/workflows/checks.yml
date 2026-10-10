@@ -1,0 +1,104 @@
+# Shared checks for Link Robins, BlizzNux and karl-bullock repos. Each repo
+# calls this with a few lines (see README.md), so a check added here reaches
+# every repo at once.
+#
+#   ShellCheck  NEW warnings in shell scripts, compared with the base commit,
+#               so existing, reviewed findings never block a PR
+#   Gitleaks    secrets in the commits this push or PR adds
+#
+# Everything runs in containers fed over stdin (tar / git log), never through
+# `docker run -v`. On a self-hosted runner that is itself a container, -v
+# resolves paths on the HOST and silently mounts nothing.
+#
+# This repo is public on purpose: a reusable workflow in a private repo can
+# only be called from the same owner, and these are called from three. It
+# holds no secrets and needs none.
+name: Shared checks
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: 'Runner labels as JSON, e.g. ["self-hosted","kvm4"]'
+        type: string
+        default: '"ubuntu-latest"'
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: ShellCheck (new warnings)
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compare with the base commit
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -u
+          IMG=koalaman/shellcheck-alpine:v0.11.0
+          # Shell files at a revision: *.sh / *.bash, plus extensionless files
+          # whose first line is a shell shebang.
+          shfiles() {
+            git ls-tree -r --name-only "$1" | grep -v -E '(^|/)(node_modules|vendor)/' | while IFS= read -r f; do
+              case "$f" in
+                *.sh|*.bash) echo "$f" ;;
+                */*.*|*.*) ;;
+                *) git cat-file -p "$1:$f" 2>/dev/null | head -n1 | grep -qE '^#!.*[/ ](ba|da)?sh( |$)' && echo "$f" ;;
+              esac
+            done
+          }
+          scan() { # rev -> gcc-format findings
+            files=$(shfiles "$1")
+            [ -n "$files" ] || return 0
+            # shellcheck disable=SC2086
+            git archive "$1" -- $files | docker run --rm -i --entrypoint sh "$IMG" -c \
+              'mkdir /s && tar x -C /s && cd /s && find . -type f | sed "s|^\./||" | sort | tr "\n" "\0" | xargs -0 shellcheck -f gcc -S warning' || true
+          }
+          norm() { sed -E 's/^([^:]+):[0-9]+:[0-9]+: /\1: /' | sort; }
+          scan HEAD > "$RUNNER_TEMP/head.txt"
+          if [ -n "$BASE" ] && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            scan "$BASE" > "$RUNNER_TEMP/base.txt"
+          else
+            echo "No base commit (first push or manual run): every finding counts."
+            : > "$RUNNER_TEMP/base.txt"
+          fi
+          norm < "$RUNNER_TEMP/base.txt" > "$RUNNER_TEMP/b.txt"
+          norm < "$RUNNER_TEMP/head.txt" | comm -13 "$RUNNER_TEMP/b.txt" - > "$RUNNER_TEMP/new.txt"
+          echo "$(grep -c . "$RUNNER_TEMP/head.txt") warning(s) in total, $(grep -c . "$RUNNER_TEMP/new.txt") new."
+          [ -s "$RUNNER_TEMP/new.txt" ] || { echo "No new ShellCheck warnings."; exit 0; }
+          while IFS= read -r l; do
+            f=${l%%: *}; rest=${l#*: }
+            full=$(grep -F -- "$rest" "$RUNNER_TEMP/head.txt" | grep -F -- "$f:" | head -1)
+            line=$(echo "$full" | cut -d: -f2)
+            echo "::error file=$f,line=$line::$rest"
+          done < "$RUNNER_TEMP/new.txt"
+          exit 1
+
+  gitleaks:
+    name: Gitleaks (new commits)
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan the commits this change adds
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -u
+          if [ -n "$BASE" ] && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            range="$BASE..HEAD"
+          else
+            range="HEAD"
+          fi
+          echo "Scanning $range"
+          git log -p --no-color "$range" | docker run --rm -i zricethezav/gitleaks:v8.30.1 \
+            stdin --no-banner --redact --log-level warn \
+            || { echo "::error::Gitleaks found a secret in $range. Remove it and rotate it; a pushed secret must be treated as leaked."; exit 1; }
+          echo "No secrets in $range."

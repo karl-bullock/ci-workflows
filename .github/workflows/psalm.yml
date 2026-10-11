@@ -1,0 +1,149 @@
+# Psalm taint analysis for Flarum extensions. CodeQL does not read PHP, so
+# this is the security scan for an extension's backend: it follows user input
+# from the request to SQL, HTML and shell sinks.
+#
+# Out of the box Psalm only treats $_GET and friends as user input, and
+# Flarum never reads those: input arrives through PSR-7 requests and the
+# JSON:API context, and queries go through Laravel. The stub below teaches
+# Psalm those sources and sinks. Without it a scan finds nothing and looks
+# clean while checking nothing.
+#
+# Report-only for now: findings go to the repository's code scanning page
+# (category "psalm-taint") and never fail the build. A Psalm crash does fail
+# it, so a broken scan cannot pass for a clean one.
+#
+# It scans src/ and extend.php with a generated config, so the calling
+# repository needs no Psalm setup of its own.
+name: Psalm taint analysis
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: 'Runner labels as JSON, e.g. ["self-hosted","kvm4"]'
+        type: string
+        default: '"ubuntu-latest"'
+      php-version:
+        description: PHP version to run Psalm on
+        type: string
+        default: '8.4'
+
+jobs:
+  taint:
+    name: Psalm taint analysis
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ inputs.php-version }}
+          tools: composer
+          coverage: none
+
+      - name: Install the extension's dependencies
+        run: composer install --no-interaction --no-progress --no-scripts --prefer-dist
+
+      # Psalm goes in its own directory so it never touches the extension's
+      # composer.lock or clashes with its dev dependencies.
+      - name: Install Psalm
+        run: |
+          mkdir -p "$RUNNER_TEMP/psalm"
+          composer require --no-interaction --no-progress --working-dir="$RUNNER_TEMP/psalm" vimeo/psalm:^6
+
+      - name: Write the Flarum taint stub
+        run: |
+          cat > "$RUNNER_TEMP/flarum-taint.phpstub" <<'STUB'
+          <?php
+          namespace Psr\Http\Message {
+              interface ServerRequestInterface {
+                  /** @psalm-taint-source input */ public function getQueryParams(): array;
+                  /** @psalm-taint-source input */ public function getParsedBody();
+                  /** @psalm-taint-source input */ public function getCookieParams(): array;
+                  /** @psalm-taint-source input */ public function getUploadedFiles(): array;
+              }
+          }
+          namespace Tobyz\JsonApiServer {
+              class Context {
+                  /** @psalm-taint-source input */ public function queryParam(string $name, $default = null) {}
+                  /** @psalm-taint-source input */ public function body(): ?array {}
+              }
+          }
+          namespace Illuminate\Support {
+              class Arr {
+                  /** @psalm-flow ($array) -> return */ public static function get($array, $key, $default = null) {}
+                  /** @psalm-flow ($array) -> return */ public static function pull(&$array, $key, $default = null) {}
+              }
+          }
+          namespace Illuminate\Database {
+              interface ConnectionInterface {
+                  /** @psalm-taint-sink sql $query */ public function select($query, $bindings = [], $useReadPdo = true);
+                  /** @psalm-taint-sink sql $query */ public function selectOne($query, $bindings = [], $useReadPdo = true);
+                  /** @psalm-taint-sink sql $query */ public function statement($query, $bindings = []);
+                  /** @psalm-taint-sink sql $query */ public function unprepared($query);
+                  /** @psalm-taint-sink sql $query */ public function insert($query, $bindings = []);
+                  /** @psalm-taint-sink sql $query */ public function update($query, $bindings = []);
+                  /** @psalm-taint-sink sql $query */ public function delete($query, $bindings = []);
+                  /** @psalm-taint-sink sql $value */ public function raw($value);
+              }
+          }
+          namespace Illuminate\Database\Query {
+              class Builder {
+                  /** @psalm-taint-sink sql $sql */ public function whereRaw($sql, $bindings = [], $boolean = 'and') {}
+                  /** @psalm-taint-sink sql $sql */ public function orWhereRaw($sql, $bindings = []) {}
+                  /** @psalm-taint-sink sql $expression */ public function selectRaw($expression, array $bindings = []) {}
+                  /** @psalm-taint-sink sql $sql */ public function orderByRaw($sql, $bindings = []) {}
+                  /** @psalm-taint-sink sql $sql */ public function havingRaw($sql, array $bindings = [], $boolean = 'and') {}
+                  /** @psalm-taint-sink sql $sql */ public function groupByRaw($sql, array $bindings = []) {}
+              }
+          }
+          namespace Illuminate\Database\Eloquent {
+              class Builder {
+                  /** @psalm-taint-sink sql $sql */ public function whereRaw($sql, $bindings = [], $boolean = 'and') {}
+                  /** @psalm-taint-sink sql $sql */ public function orWhereRaw($sql, $bindings = []) {}
+                  /** @psalm-taint-sink sql $sql */ public function orderByRaw($sql, $bindings = []) {}
+                  /** @psalm-taint-sink sql $expression */ public function selectRaw($expression, array $bindings = []) {}
+              }
+          }
+          STUB
+
+      - name: Run Psalm
+        run: |
+          set -u
+          # The config sits in the checkout so that the report's paths are
+          # relative to the repository root, which code scanning needs.
+          files=""
+          [ -d src ] && files="$files<directory name=\"src\"/>"
+          [ -f extend.php ] && files="$files<file name=\"extend.php\"/>"
+          [ -n "$files" ] || { echo "::error::No src/ or extend.php to scan."; exit 1; }
+          cat > .psalm-ci.xml <<XML
+          <?xml version="1.0"?>
+          <psalm errorLevel="8" findUnusedCode="false" findUnusedBaselineEntry="false" xmlns="https://getpsalm.org/schema/config">
+              <projectFiles>$files<ignoreFiles><directory name="vendor"/></ignoreFiles></projectFiles>
+              <stubs><file name="$RUNNER_TEMP/flarum-taint.phpstub"/></stubs>
+          </psalm>
+          XML
+          set +e
+          "$RUNNER_TEMP/psalm/vendor/bin/psalm" --config=.psalm-ci.xml --taint-analysis \
+            --no-cache --no-progress --threads=4 --report=psalm.sarif
+          code=$?
+          set -e
+          # 0 = clean, 2 = findings (reported, not blocking). Anything else
+          # means Psalm itself failed.
+          case $code in
+            0) echo "No taint findings." ;;
+            2) echo "::warning::Psalm found tainted data flows. See the code scanning page (category psalm-taint)." ;;
+            *) echo "::error::Psalm exited with $code."; exit "$code" ;;
+          esac
+          [ -s psalm.sarif ] || { echo "::error::Psalm wrote no SARIF report."; exit 1; }
+
+      # A pull request from a fork gets a read-only token and cannot upload.
+      - name: Upload to code scanning
+        if: github.event.pull_request.head.repo.fork != true
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: psalm.sarif
+          category: psalm-taint

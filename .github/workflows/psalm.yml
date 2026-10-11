@@ -8,6 +8,11 @@
 # Psalm those sources and sinks. Without it a scan finds nothing and looks
 # clean while checking nothing.
 #
+# Values a Flarum 2 API field receives arrive as closure parameters
+# (->set(fn ($model, $value) ...), ->save, ->deserialize, ->validate), which
+# no stub can mark. A small plugin, written out below, treats those
+# parameters as user input.
+#
 # Report-only for now: findings go to the repository's code scanning page
 # (category "psalm-taint") and never fail the build. A Psalm crash does fail
 # it, so a broken scan cannot pass for a clean one.
@@ -110,6 +115,111 @@ jobs:
           }
           STUB
 
+      - name: Write the Flarum field plugin
+        run: |
+          cat > "$RUNNER_TEMP/FlarumFieldTaint.php" <<'PLUGIN'
+          <?php
+
+          use PhpParser\Node\Expr\ArrowFunction;
+          use PhpParser\Node\Expr\Closure;
+          use PhpParser\Node\Expr\MethodCall;
+          use PhpParser\Node\Expr\Variable;
+          use PhpParser\Node\Identifier;
+          use Psalm\Plugin\EventHandler\AddTaintsInterface;
+          use Psalm\Plugin\EventHandler\BeforeExpressionAnalysisInterface;
+          use Psalm\Plugin\EventHandler\Event\AddRemoveTaintsEvent;
+          use Psalm\Plugin\EventHandler\Event\BeforeExpressionAnalysisEvent;
+          use Psalm\Type\TaintKindGroup;
+
+          /**
+           * Marks the value a Flarum 2 API field receives from the request as user input.
+           *
+           * A writable field hands its value to the extension as a closure parameter:
+           *
+           *   ->deserialize(fn ($value, $context) => ...)
+           *   ->validate(fn ($value, $fail, $context) => ...)
+           *   ->set(fn ($model, $value, $context) => ...)
+           *   ->save(fn ($model, $value, $context) => ...)
+           *
+           * The value travels from the JSON:API body through the server's own code into
+           * that closure, which Psalm never follows, so on its own it treats the value
+           * as clean. This plugin notes each such closure as the call is analysed (the
+           * call is seen before its arguments) and then adds input taints wherever the
+           * value parameter is read inside it.
+           */
+          final class FlarumFieldTaint implements BeforeExpressionAnalysisInterface, AddTaintsInterface
+          {
+              /** Method name => position of the value among the closure's parameters. */
+              private const VALUE_PARAM = [
+                  'deserialize' => 0,
+                  'validate' => 0,
+                  'set' => 1,
+                  'save' => 1,
+              ];
+
+              /** @var array<string, list<array{int, int, string}>> file => [start, end, $name] */
+              private static array $closures = [];
+
+              public static function beforeExpressionAnalysis(BeforeExpressionAnalysisEvent $event): ?bool
+              {
+                  $expr = $event->getExpr();
+
+                  if (! $expr instanceof MethodCall || ! $expr->name instanceof Identifier) {
+                      return null;
+                  }
+
+                  $position = self::VALUE_PARAM[strtolower($expr->name->name)] ?? null;
+
+                  if ($position === null) {
+                      return null;
+                  }
+
+                  foreach ($expr->getArgs() as $arg) {
+                      $fn = $arg->value;
+
+                      // Only a closure that has the value parameter at all; setters
+                      // often leave off the trailing $context.
+                      if ((! $fn instanceof Closure && ! $fn instanceof ArrowFunction)
+                          || count($fn->params) <= $position
+                      ) {
+                          continue;
+                      }
+
+                      $param = $fn->params[$position]->var;
+
+                      if ($param instanceof Variable && is_string($param->name)) {
+                          self::$closures[$event->getStatementsSource()->getFilePath()][] = [
+                              (int) $fn->getAttribute('startFilePos'),
+                              (int) $fn->getAttribute('endFilePos'),
+                              $param->name,
+                          ];
+                      }
+                  }
+
+                  return null;
+              }
+
+              public static function addTaints(AddRemoveTaintsEvent $event): array
+              {
+                  $expr = $event->getExpr();
+
+                  if (! $expr instanceof Variable || ! is_string($expr->name)) {
+                      return [];
+                  }
+
+                  $pos = (int) $expr->getAttribute('startFilePos');
+
+                  foreach (self::$closures[$event->getStatementsSource()->getFilePath()] ?? [] as [$start, $end, $name]) {
+                      if ($name === $expr->name && $pos > $start && $pos < $end) {
+                          return TaintKindGroup::ALL_INPUT;
+                      }
+                  }
+
+                  return [];
+              }
+          }
+          PLUGIN
+
       - name: Run Psalm
         run: |
           set -u
@@ -124,6 +234,7 @@ jobs:
           <psalm errorLevel="8" findUnusedCode="false" findUnusedBaselineEntry="false" xmlns="https://getpsalm.org/schema/config">
               <projectFiles>$files<ignoreFiles><directory name="vendor"/></ignoreFiles></projectFiles>
               <stubs><file name="$RUNNER_TEMP/flarum-taint.phpstub"/></stubs>
+              <plugins><plugin filename="$RUNNER_TEMP/FlarumFieldTaint.php"/></plugins>
           </psalm>
           XML
           set +e

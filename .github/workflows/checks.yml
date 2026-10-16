@@ -61,10 +61,13 @@ jobs:
           }
           norm() { sed -E 's/^([^:]+):[0-9]+:[0-9]+: /\1: /' | sort; }
           scan HEAD > "$RUNNER_TEMP/head.txt"
+          # A release or tag run has no `before`: compare with the previous tag,
+          # or every long-standing warning would count as new.
+          [ -n "$BASE" ] || BASE=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)
           if [ -n "$BASE" ] && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
             scan "$BASE" > "$RUNNER_TEMP/base.txt"
           else
-            echo "No base commit (first push or manual run): every finding counts."
+            echo "No base commit or earlier tag (first push or manual run): every finding counts."
             : > "$RUNNER_TEMP/base.txt"
           fi
           norm < "$RUNNER_TEMP/base.txt" > "$RUNNER_TEMP/b.txt"
@@ -92,6 +95,9 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
           set -u
+          # A release or tag run has no `before`: scan what is new since the
+          # previous tag, not the repository's whole history.
+          [ -n "$BASE" ] || BASE=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)
           if [ -n "$BASE" ] && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
             range="$BASE..HEAD"
           else

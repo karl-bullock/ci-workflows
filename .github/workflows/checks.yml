@@ -40,6 +40,9 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
           set -u
+          # One byte-order collation for sort and comm. Ubuntu 26.04 runners ship uutils coreutils, whose
+          # sort and comm disagree under en_US.UTF-8 ("comm: file is not in sorted order"), failing the step.
+          export LC_ALL=C
           IMG=koalaman/shellcheck-alpine:v0.11.0
           # Shell files at a revision: *.sh / *.bash, plus extensionless files
           # whose first line is a shell shebang.
